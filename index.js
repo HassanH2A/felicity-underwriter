@@ -1,4 +1,3 @@
-require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const fetch = require('node-fetch');
 
