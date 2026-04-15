@@ -123,7 +123,7 @@ async function lookupProperty(address) {
     console.log('    Searching the web for property data...');
 
     const resp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
@@ -180,7 +180,7 @@ async function findComps(property, daysBack = 180) {
     console.log(`    Searching the web for comps (${months} months)...`);
 
     const resp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-3-5-sonnet-20241022',
       max_tokens: 2000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
@@ -289,7 +289,7 @@ ${askingPrice ? `Asking vs MAO: ${askingPrice > formula.highOffer ? 'ABOVE MAO b
 Write 3-4 sharp sentences covering: comp quality and consistency, neighbourhood signal, any deal flags, and a clear verdict. Be direct -- this is read by a wholesaler about to make a phone call.`;
 
   const resp = await anthropic.messages.create({
-    model:      'claude-sonnet-4-20250514',
+    model:      'claude-3-5-sonnet-20241022',
     max_tokens: 400,
     messages:   [{ role: 'user', content: prompt }],
   });
