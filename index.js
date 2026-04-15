@@ -1,15 +1,15 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const fetch = require('node-fetch');
-
+ 
 // ── ENV ──────────────────────────────────────────────────────────────────────
 const NOTION_TOKEN  = process.env.NOTION_TOKEN;
-const NOTION_DB     = process.env.NOTION_DATABASE_ID;
+const NOTION_DB     = (process.env.NOTION_DATABASE_ID || '').replace(/^=/, '').trim();
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const POLL_MS       = 60_000;
-
+ 
 const anthropic  = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const processing = new Set(); // cards currently in flight
-
+ 
 // ── REHAB RATES ───────────────────────────────────────────────────────────────
 const REHAB_RATES = {
   'Turnkey':       0,
@@ -18,7 +18,7 @@ const REHAB_RATES = {
   'Torn':          55,
 };
 const DEFAULT_REHAB = 35;
-
+ 
 // ── NOTION HELPERS ────────────────────────────────────────────────────────────
 async function notionRequest(path, method = 'GET', body = null) {
   const res = await fetch(`https://api.notion.com/v1${path}`, {
@@ -30,9 +30,13 @@ async function notionRequest(path, method = 'GET', body = null) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  return res.json();
+  const json = await res.json();
+  if (json.object === 'error') {
+    console.error(`  Notion API error: ${json.message} (${json.code})`);
+  }
+  return json;
 }
-
+ 
 async function getUnderwritingCards() {
   const data = await notionRequest(`/databases/${NOTION_DB}/query`, 'POST', {
     filter: {
@@ -44,11 +48,11 @@ async function getUnderwritingCards() {
   });
   return data.results || [];
 }
-
+ 
 function getTitle(card) {
   return card.properties?.Name?.title?.map(t => t.plain_text).join('') || '';
 }
-
+ 
 function getProp(card, name, type = 'rich_text') {
   const p = card.properties?.[name];
   if (!p) return null;
@@ -58,19 +62,19 @@ function getProp(card, name, type = 'rich_text') {
   if (type === 'checkbox')  return p.checkbox ?? false;
   return null;
 }
-
+ 
 async function patchCard(pageId, properties) {
   return notionRequest(`/pages/${pageId}`, 'PATCH', { properties });
 }
-
+ 
 async function setStatus(pageId, status) {
   return patchCard(pageId, { Status: { status: { name: status } } });
 }
-
+ 
 async function appendBlocks(pageId, text) {
   const lines  = text.split('\n');
   const blocks = [];
-
+ 
   for (const line of lines) {
     if (line.startsWith('# ')) {
       blocks.push({ object: 'block', type: 'heading_1',
@@ -91,7 +95,7 @@ async function appendBlocks(pageId, text) {
         paragraph: { rich_text: [{ type: 'text', text: { content: line } }] } });
     }
   }
-
+ 
   // Notion allows max 100 blocks per request
   for (let i = 0; i < blocks.length; i += 100) {
     await notionRequest(`/blocks/${pageId}/children`, 'PATCH', {
@@ -99,19 +103,19 @@ async function appendBlocks(pageId, text) {
     });
   }
 }
-
+ 
 // ── PROPERTY LOOKUP ───────────────────────────────────────────────────────────
 function stripRedfin(text) {
   // Redfin prepends "{}&&\n" to all JSON responses
   return JSON.parse(text.replace(/^\{\}&&\n/, ''));
 }
-
+ 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept':     'application/json, text/javascript, */*; q=0.01',
   'Referer':    'https://www.redfin.com/',
 };
-
+ 
 async function lookupPropertyRedfin(address) {
   try {
     const searchRes  = await fetch(
@@ -122,11 +126,11 @@ async function lookupPropertyRedfin(address) {
     const match      = searchData.payload?.exactMatch
                     || searchData.payload?.sections?.[0]?.rows?.[0];
     if (!match) return null;
-
+ 
     const propId  = match.id?.split('_')?.[1];
     const propUrl = match.url;
     if (!propId) return null;
-
+ 
     const detailRes  = await fetch(
       `https://www.redfin.com/stingray/api/home/details/aboveTheFold?propertyId=${propId}&accessLevel=1`,
       { headers: { ...HEADERS, Referer: 'https://www.redfin.com' + propUrl } }
@@ -134,18 +138,18 @@ async function lookupPropertyRedfin(address) {
     const detailData = stripRedfin(await detailRes.text());
     const details    = detailData.payload?.aboveTheFold?.propertyDetails || {};
     const keyFacts   = detailData.payload?.aboveTheFold?.keyFacts || [];
-
+ 
     // keyFacts is an array like [{ label: 'Sq. Ft.', value: '1,200' }, ...]
     function getFact(label) {
       const f = keyFacts.find(k => k.label?.toLowerCase().includes(label.toLowerCase()));
       return f?.value?.replace(/,/g, '') || null;
     }
-
+ 
     const sqft      = getFact('sq') || getFact('sqft') || details.sqFt?.value || match.sqFt;
     const yearBuilt = getFact('year')  || details.yearBuilt?.value || match.yearBuilt;
     const beds      = getFact('bed')   || details.beds?.value      || match.beds;
     const baths     = getFact('bath')  || details.baths?.value     || match.baths;
-
+ 
     return {
       address,
       sqft:        sqft      ? parseInt(String(sqft).replace(/\D/g, ''))      : null,
@@ -164,25 +168,25 @@ async function lookupPropertyRedfin(address) {
     return null;
   }
 }
-
+ 
 async function lookupProperty(address) {
   const result = await lookupPropertyRedfin(address);
   if (result?.sqft) return result;
   return null;
 }
-
+ 
 // ── COMP SEARCH ───────────────────────────────────────────────────────────────
 async function findComps(property, daysBack = 180) {
   try {
     const { sqft, yearBuilt, lat, lng, propertyId, redfinUrl } = property;
     if (!lat || !lng) return [];
-
+ 
     const sqftMin = Math.round(sqft * 0.8);
     const sqftMax = Math.round(sqft * 1.2);
     const yrMin   = (yearBuilt || 1985) - 10;
     const yrMax   = (yearBuilt || 1985) + 10;
     const offset  = 0.0072; // ~0.5 miles
-
+ 
     const params = new URLSearchParams({
       al:                   1,
       include_nearby_homes:  true,
@@ -203,20 +207,20 @@ async function findComps(property, daysBack = 180) {
       min_year_built:        yrMin,
       max_year_built:        yrMax,
     });
-
+ 
     const url = `https://www.redfin.com/stingray/api/gis?${params}`;
     const res  = await fetch(url, {
       headers: { ...HEADERS, Referer: redfinUrl || 'https://www.redfin.com' },
     });
     const data = stripRedfin(await res.text());
     const homes = data.payload?.homes || [];
-
+ 
     const comps = [];
     for (const h of homes) {
       const price = h.price?.value;
       const hsqft = h.sqFt?.value || h.sqft;
       if (!price || !hsqft) continue;
-
+ 
       const psf        = Math.round(price / hsqft);
       const soldDate   = h.soldDate || h.lastSaleDate || 'Unknown';
       const homeAddr   = [
@@ -225,7 +229,7 @@ async function findComps(property, daysBack = 180) {
         h.state?.value      || h.address?.state,
       ].filter(Boolean).join(', ');
       const homeUrl = 'https://www.redfin.com' + (h.url || '');
-
+ 
       comps.push({
         address:  homeAddr || 'Unknown',
         salePrice: parseInt(price),
@@ -235,32 +239,32 @@ async function findComps(property, daysBack = 180) {
         url:       homeUrl,
       });
     }
-
+ 
     return comps.slice(0, 5);
   } catch (err) {
     console.error('  Comp search error:', err.message);
     return [];
   }
 }
-
+ 
 // ── FORMULA ───────────────────────────────────────────────────────────────────
 function runFormula(arv, sqft, rehabPerSqft) {
   const rehab    = sqft * rehabPerSqft;
   const closing  = arv * 0.06;
   const carrying = arv * 0.02;
-
+ 
   // Conservative — anchor offer
   const flipC  = arv * 0.20;
   const feeC   = Math.max(10_000, arv * 0.10);
   const dispoC = arv - rehab - closing - carrying - flipC;
   const lowOffer = dispoC - feeC;
-
+ 
   // Aggressive — MAO
   const flipA  = arv * 0.10;
   const feeA   = 10_000;
   const dispoA = arv - rehab - closing - carrying - flipA;
   const highOffer = dispoA - feeA;
-
+ 
   return {
     arv:          Math.round(arv),
     rehab:        Math.round(rehab),
@@ -277,32 +281,32 @@ function runFormula(arv, sqft, rehabPerSqft) {
     offerArvRatio: highOffer / arv,
   };
 }
-
+ 
 // ── CLAUDE NOTES ─────────────────────────────────────────────────────────────
 async function generateNotes(address, property, comps, formula, condition, askingPrice) {
   const $ = n => n != null ? '$' + Math.round(n).toLocaleString() : 'N/A';
   const pct = n => (n * 100).toFixed(1) + '%';
   const avgPsf = Math.round(comps.reduce((s, c) => s + c.psf, 0) / comps.length);
-
+ 
   const prompt = `You are the underwriting AI for Felicity Capital, a real estate wholesaling company that assigns contracts to fix-and-flip investors.
-
+ 
 SUBJECT PROPERTY
 Address: ${address}
 Sqft: ${property.sqft} | Beds: ${property.beds} | Baths: ${property.baths} | Year Built: ${property.yearBuilt}
 Condition: ${condition || 'Full Rehab (assumed)'}
 Asking Price: ${askingPrice ? $(askingPrice) : 'Not provided'}
-
+ 
 COMPS (${comps.length} found)
 ${comps.map((c, i) => `${i + 1}. ${c.address} | Sold ${$(c.salePrice)} | ${c.sqft} sqft | $${c.psf}/sqft | ${c.saleDate}`).join('\n')}
 Average PSF: $${avgPsf}/sqft → ARV: ${$(formula.arv)}
-
+ 
 RESULTS
 Offer range: ${$(formula.lowOffer)} – ${$(formula.highOffer)}
 Offer/ARV: ${pct(formula.offerArvRatio)}
 ${askingPrice ? `Asking vs MAO: ${askingPrice > formula.highOffer ? 'ABOVE MAO by ' + $(askingPrice - formula.highOffer) : 'BELOW MAO by ' + $(formula.highOffer - askingPrice)}` : ''}
-
-Write 3–4 sharp sentences covering: comp quality and consistency, neighbourhood signal from the address, any deal flags, and a clear verdict. Be direct — this is read by a wholesaler about to make a phone call.`;
-
+ 
+Write 3-4 sharp sentences covering: comp quality and consistency, neighbourhood signal from the address, any deal flags, and a clear verdict. Be direct -- this is read by a wholesaler about to make a phone call.`;
+ 
   const resp = await anthropic.messages.create({
     model:      'claude-sonnet-4-20250514',
     max_tokens: 400,
@@ -310,109 +314,111 @@ Write 3–4 sharp sentences covering: comp quality and consistency, neighbourhoo
   });
   return resp.content[0].text.trim();
 }
-
+ 
 // ── SUMMARY BUILDER ───────────────────────────────────────────────────────────
 function buildSummary({ address, property, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate }) {
   const $   = n => n != null ? '$' + Math.round(n).toLocaleString() : 'N/A';
   const pct = n => (n * 100).toFixed(1) + '%';
   const flags = [];
-
+ 
   if (askingPrice && askingPrice > formula.arv)
-    flags.push('⚠️  Seller asking ABOVE ARV — property may be overpriced');
+    flags.push('Warning: Seller asking ABOVE ARV -- property may be overpriced');
   if (askingPrice && askingPrice > formula.highOffer)
-    flags.push(`⚠️  Seller asking ${$(askingPrice - formula.highOffer)} above MAO — tough negotiation ahead`);
+    flags.push(`Warning: Seller asking ${$(askingPrice - formula.highOffer)} above MAO -- tough negotiation ahead`);
   if (formula.offerArvRatio > 0.85)
-    flags.push('⚠️  Offer/ARV > 85% — thin margin for your buyer, push for lower price');
+    flags.push('Warning: Offer/ARV > 85% -- thin margin for your buyer, push for lower price');
   if (comps.length < 5)
-    flags.push(`ℹ️  Only ${comps.length} comps found — ARV estimate less certain`);
+    flags.push(`Note: Only ${comps.length} comps found -- ARV estimate less certain`);
   if (formula.offerArvRatio <= 0.72 && formula.highOffer > 0)
-    flags.push('✅  Strong spread — excellent deal if numbers hold');
-
+    flags.push('Strong spread -- excellent deal if numbers hold');
+ 
   return `# Underwriting Report
 Auto-generated by Felicity Capital Underwriter
-
+ 
 ## Property Details
 Address: ${address}
 Source: ${property.source}
 Sqft: ${property.sqft?.toLocaleString()} | Beds: ${property.beds} | Baths: ${property.baths} | Year Built: ${property.yearBuilt}
-Condition: ${condition || 'Full Rehab (default)'} → $${rehabRate}/sqft rehab rate
-
+Condition: ${condition || 'Full Rehab (default)'} > $${rehabRate}/sqft rehab rate
+ 
 ## Comparable Sales
 ${comps.map((c, i) =>
   `${i + 1}. ${c.address}
    Sold: ${$(c.salePrice)} | ${c.sqft?.toLocaleString()} sqft | $${c.psf}/sqft | ${c.saleDate}
    ${c.url}`
 ).join('\n\n')}
-
+ 
 Average PSF: $${Math.round(avgPsf)}/sqft across ${comps.length} comps
-
+ 
 ## Formula Breakdown
 ARV:                      ${$(formula.arv)}
-− Rehab Cost:             ${$(formula.rehab)}  (${property.sqft?.toLocaleString()} sqft × $${rehabRate})
-− Closing Costs:          ${$(formula.closing)}  (6% of ARV)
-− Carrying Costs:         ${$(formula.carrying)}  (2% of ARV)
-
+Rehab Cost:               ${$(formula.rehab)}  (${property.sqft?.toLocaleString()} sqft x $${rehabRate})
+Closing Costs:            ${$(formula.closing)}  (6% of ARV)
+Carrying Costs:           ${$(formula.carrying)}  (2% of ARV)
+ 
 Conservative offer (anchor):
-  − Flip Profit:          ${$(formula.flipC)}  (20% of ARV)
-  − Assignment Fee:       ${$(formula.feeC)}  (10% of ARV)
+  Flip Profit:            ${$(formula.flipC)}  (20% of ARV)
+  Assignment Fee:         ${$(formula.feeC)}  (10% of ARV)
   = Low Offer:            ${$(formula.lowOffer)}
-
+ 
 Aggressive offer (MAO):
-  − Flip Profit:          ${$(formula.flipA)}  (10% of ARV)
-  − Assignment Fee:       $10,000  (minimum)
+  Flip Profit:            ${$(formula.flipA)}  (10% of ARV)
+  Assignment Fee:         $10,000  (minimum)
   = High Offer / MAO:     ${$(formula.highOffer)}
-
+ 
 ## Offer Range
 Anchor (start here on the phone):   ${$(formula.lowOffer)}
 MAO (never go above this):          ${$(formula.highOffer)}
 Offer / ARV:                        ${pct(formula.offerArvRatio)}
 ${askingPrice ? `Asking Price:                       ${$(askingPrice)}` : ''}
-
+ 
 ## Flags
-${flags.length ? flags.join('\n') : '✅  No flags — numbers look clean'}
-
+${flags.length ? flags.join('\n') : 'No flags -- numbers look clean'}
+ 
 ## Assessment
 ${notes}`;
 }
-
+ 
 // ── PROCESS ONE CARD ─────────────────────────────────────────────────────────
 async function processCard(card) {
   const address = getTitle(card);
   if (!address || address.toLowerCase() === 'new page') return;
-
-  console.log(`\n📍  ${address}`);
-
+ 
+  console.log(`\n  ${address}`);
+ 
   try {
     const condition   = getProp(card, 'Condition', 'select') || '';
-    const askingPrice = getProp(card, 'Asking Price', 'number');
-
+    // Asking Price is a text field in Notion, so read as rich_text and parse
+    const askingRaw   = getProp(card, 'Asking Price', 'rich_text');
+    const askingPrice = askingRaw ? parseFloat(String(askingRaw).replace(/[^0-9.]/g, '')) || null : null;
+ 
     // ── Step 2: Property lookup
     console.log('    Looking up property...');
     const property = await lookupProperty(address);
-
+ 
     if (!property?.sqft) {
       await setStatus(card.id, 'Gathering Info');
       const missing = !property
-        ? 'address not found in any database — please verify it is correct'
+        ? 'address not found in any database -- please verify it is correct'
         : 'square footage could not be retrieved';
       await appendBlocks(card.id,
-        `⚠️ Underwriting paused\n\nCould not retrieve property details: ${missing}.\n\nPlease add manually: Sqft, Year Built, Beds, Baths.`);
-      console.log('    → Gathering Info (property not found)');
+        `Underwriting paused\n\nCould not retrieve property details: ${missing}.\n\nPlease add manually: Sqft, Year Built, Beds, Baths.`);
+      console.log('    > Gathering Info (property not found)');
       return;
     }
-
-    console.log(`    → ${property.sqft} sqft | ${property.beds}bd/${property.baths}ba | built ${property.yearBuilt}`);
+ 
+    console.log(`    > ${property.sqft} sqft | ${property.beds}bd/${property.baths}ba | built ${property.yearBuilt}`);
     await patchCard(card.id, { Sqft: { number: property.sqft } });
-
+ 
     // ── Step 3: Comps
     console.log('    Searching comps (6 months)...');
     let comps = await findComps(property, 180);
-
+ 
     if (comps.length < 3) {
-      console.log(`    → Only ${comps.length}, expanding to 12 months...`);
+      console.log(`    > Only ${comps.length}, expanding to 12 months...`);
       comps = await findComps(property, 365);
     }
-
+ 
     if (comps.length < 3) {
       await setStatus(card.id, 'Gathering Info');
       const sqftMin = Math.round(property.sqft * 0.8);
@@ -420,77 +426,81 @@ async function processCard(card) {
       const yrMin   = (property.yearBuilt || 1985) - 10;
       const yrMax   = (property.yearBuilt || 1985) + 10;
       await appendBlocks(card.id,
-        `⚠️ Underwriting paused — insufficient comps\n\n` +
+        `Underwriting paused -- insufficient comps\n\n` +
         `Only ${comps.length} comp(s) found within 12 months.\n\n` +
         `Manual comp pull needed. Search criteria:\n` +
         `- Half mile radius\n` +
-        `- Sqft: ${sqftMin.toLocaleString()} – ${sqftMax.toLocaleString()}\n` +
-        `- Year built: ${yrMin} – ${yrMax}\n` +
+        `- Sqft: ${sqftMin.toLocaleString()} - ${sqftMax.toLocaleString()}\n` +
+        `- Year built: ${yrMin} - ${yrMax}\n` +
         `- Single family homes, sold within 12 months\n\n` +
         `Paste 3+ comp prices into the Comp #1 / #2 / #3 fields then manually re-trigger.`);
-      console.log('    → Gathering Info (insufficient comps)');
+      console.log('    > Gathering Info (insufficient comps)');
       return;
     }
-
-    console.log(`    → ${comps.length} comps found`);
-
-    // ── Step 4–6: ARV + formula
+ 
+    console.log(`    > ${comps.length} comps found`);
+ 
+    // ── Step 4-6: ARV + formula
     const avgPsf    = comps.reduce((s, c) => s + c.psf, 0) / comps.length;
     const arv       = Math.round(avgPsf * property.sqft);
     const rehabRate = REHAB_RATES[condition] ?? DEFAULT_REHAB;
     const formula   = runFormula(arv, property.sqft, rehabRate);
-
+ 
     // ── Claude assessment
     console.log('    Generating assessment...');
     const notes = await generateNotes(address, property, comps, formula, condition, askingPrice);
-
+ 
     // ── Step 7: Write back to Notion
+    // Only write to properties that are writable (not formulas)
+    // Writable: ARV (number), Sqft (number), Max Offer (number),
+    //           Rehab per Sqft (select), Desired Assignment Fee (number),
+    //           Comp #1/2/3 (url)
+    // Read-only formulas (Notion computes these): Offer, Flip Profit,
+    //           Dispo Price, $/sqft Rehab Cost, Estimated Closing Costs,
+    //           Estimated Carrying Costs, Offer/ARV
     const updates = {
-      ARV:              { number: formula.arv },
-      'Rehab per Sqft': { number: rehabRate },
-      '$/sqft Rehab Cost': { number: formula.rehab },
-      'Flip Profit':    { number: formula.flipA },
-      'Dispo Price':    { number: formula.dispoA },
-      Offer:            { number: formula.lowOffer },
-      'Max Offer':      { number: formula.highOffer },
+      ARV:                    { number: formula.arv },
+      'Max Offer':            { number: formula.highOffer },
+      'Rehab per Sqft':       { select: { name: String(rehabRate) } },
+      'Desired Assignment Fee': { number: formula.feeA },
     };
-
-    // Comp URLs (only if field type is url in Notion)
+ 
+    // Comp URLs
     try {
       if (comps[0]?.url) updates['Comp #1'] = { url: comps[0].url };
       if (comps[1]?.url) updates['Comp #2'] = { url: comps[1].url };
       if (comps[2]?.url) updates['Comp #3'] = { url: comps[2].url };
     } catch (_) {}
-
+ 
     await patchCard(card.id, updates);
-
+ 
     const summary = buildSummary({ address, property, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate });
     await appendBlocks(card.id, summary);
-
+ 
     // ── Step 8: Status
     const $ = n => '$' + Math.round(n).toLocaleString();
     let newStatus = 'Ready to Offer';
     if (formula.highOffer <= 0) newStatus = 'Pass';
-
+ 
     await setStatus(card.id, newStatus);
-
-    console.log(`    → ✅ ${newStatus} | ${$(formula.lowOffer)} – ${$(formula.highOffer)} | Offer/ARV ${(formula.offerArvRatio * 100).toFixed(1)}%`);
-
+ 
+    console.log(`    > Done: ${newStatus} | ${$(formula.lowOffer)} - ${$(formula.highOffer)} | Offer/ARV ${(formula.offerArvRatio * 100).toFixed(1)}%`);
+ 
   } catch (err) {
-    console.error(`    → ❌ ${err.message}`);
+    console.error(`    > Error: ${err.message}`);
     try {
-      await appendBlocks(card.id, `⚠️ Underwriting error: ${err.message}\n\nPlease process this card manually.`);
+      await appendBlocks(card.id, `Underwriting error: ${err.message}\n\nPlease process this card manually.`);
     } catch (_) {}
   }
 }
-
+ 
 // ── POLL ─────────────────────────────────────────────────────────────────────
 async function poll() {
   process.stdout.write(`[${new Date().toISOString()}] Polling... `);
   try {
     const cards = await getUnderwritingCards();
     console.log(`${cards.length} card(s) to process`);
-
+ 
     for (const card of cards) {
       if (processing.has(card.id)) continue;
       processing.add(card.id);
@@ -500,11 +510,24 @@ async function poll() {
     console.error('Poll error:', err.message);
   }
 }
-
+ 
 // ── START ─────────────────────────────────────────────────────────────────────
-console.log('🏠  Felicity Capital Underwriter');
-console.log(`📊  Database: ${NOTION_DB}`);
-console.log(`⏱   Polling every ${POLL_MS / 1000}s\n`);
-
+console.log('Felicity Capital Underwriter');
+console.log(`Database: ${NOTION_DB}`);
+console.log(`Polling every ${POLL_MS / 1000}s\n`);
+ 
+if (!NOTION_DB) {
+  console.error('ERROR: NOTION_DATABASE_ID is not set or empty. Check Railway environment variables.');
+  process.exit(1);
+}
+if (!NOTION_TOKEN) {
+  console.error('ERROR: NOTION_TOKEN is not set. Check Railway environment variables.');
+  process.exit(1);
+}
+if (!ANTHROPIC_KEY) {
+  console.error('ERROR: ANTHROPIC_API_KEY is not set. Check Railway environment variables.');
+  process.exit(1);
+}
+ 
 poll();
 setInterval(poll, POLL_MS);
