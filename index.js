@@ -8,13 +8,20 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const POLL_MS       = 60_000;
 
 const anthropic  = new Anthropic({ apiKey: ANTHROPIC_KEY });
-const processing = new Set(); // cards currently in flight
+const processing = new Set();
 
-// ── RATE LIMIT TRACKING ───────────────────────────────────────────────────────
-// Anthropic Tier 1: 30,000 input tokens per minute
-// We conservatively budget 25,000 to leave headroom
+// ── REHAB RATES ───────────────────────────────────────────────────────────────
+const REHAB_RATES = {
+  'Turnkey':        0,
+  'Light Cosmetic': 15,
+  'Full Rehab':     35,
+  'Torn':           55,
+};
+const DEFAULT_REHAB = 35;
+
+// ── RATE LIMIT TRACKING (Tier 1: 30k TPM, budget 25k) ─────────────────────────
 const TPM_BUDGET = 25_000;
-const tokenLog = []; // array of { time, tokens }
+const tokenLog = [];
 
 function recordTokens(n) {
   tokenLog.push({ time: Date.now(), tokens: n });
@@ -35,15 +42,6 @@ async function waitForTokenBudget(estimatedTokens) {
     await new Promise(r => setTimeout(r, waitMs));
   }
 }
-
-// ── REHAB RATES ───────────────────────────────────────────────────────────────
-const REHAB_RATES = {
-  'Turnkey':       0,
-  'Light Cosmetic': 15,
-  'Full Rehab':    35,
-  'Torn':          55,
-};
-const DEFAULT_REHAB = 35;
 
 // ── NOTION HELPERS ────────────────────────────────────────────────────────────
 async function notionRequest(path, method = 'GET', body = null) {
@@ -98,7 +96,7 @@ async function setStatus(pageId, status) {
 }
 
 async function appendBlocks(pageId, text) {
-  const lines  = text.split('\n');
+  const lines = text.split('\n');
   const blocks = [];
 
   for (const line of lines) {
@@ -129,25 +127,18 @@ async function appendBlocks(pageId, text) {
   }
 }
 
-// ── CLAUDE WEB SEARCH HELPERS ─────────────────────────────────────────────────
+// ── JSON PARSING ──────────────────────────────────────────────────────────────
 function extractText(content) {
-  return content
-    .filter(b => b.type === 'text')
-    .map(b => b.text)
-    .join('\n');
+  return content.filter(b => b.type === 'text').map(b => b.text).join('\n');
 }
 
 function parseJSON(text) {
-  // Try fenced code block first
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) return JSON.parse(fenced[1].trim());
 
-  // Try to find a JSON object or array anywhere in the text
-  // This handles cases where Claude wraps JSON in prose like "Based on my search..."
   const objMatch = text.match(/\{[\s\S]*\}/);
   const arrMatch = text.match(/\[[\s\S]*\]/);
 
-  // Prefer whichever appears first and is larger
   let candidate = null;
   if (objMatch && arrMatch) {
     candidate = objMatch.index < arrMatch.index ? objMatch[0] : arrMatch[0];
@@ -156,124 +147,57 @@ function parseJSON(text) {
   }
 
   if (candidate) return JSON.parse(candidate);
-
-  // Last resort: try parsing the raw text
   return JSON.parse(text.trim());
 }
 
-// ── PROPERTY LOOKUP (Claude + web search) ─────────────────────────────────────
-async function lookupProperty(address) {
-  try {
-    console.log('    Searching the web for property data...');
-    await waitForTokenBudget(8000); // web_search calls can run 5-10k input tokens
+// ── UNDERWRITE (one consolidated call: property + comps + ARV) ─────────────────
+async function underwrite(address) {
+  console.log('    Researching property and comps...');
+  await waitForTokenBudget(15000);
 
-    const resp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 500,
-      tools: [{
-        type: 'web_search_20250305',
-        name: 'web_search',
-        max_uses: 2,
-      }],
-      messages: [{
-        role: 'user',
-        content: `Zillow lookup: ${address}
+  const resp = await anthropic.messages.create({
+    model: 'claude-sonnet-4-5-20250929',
+    max_tokens: 1500,
+    tools: [{
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 3,
+    }],
+    messages: [{
+      role: 'user',
+      content: `You are underwriting a US real estate wholesale deal. Address: ${address}
 
-Return ONLY JSON, no prose. Format: {"sqft":0,"yearBuilt":0,"beds":0,"baths":0,"lat":0,"lng":0,"sourceUrl":"..."}
+This address could be anywhere in the United States. Do not assume a location.
 
-Not found: {"error":"not found"}`
-      }],
-    });
+Task 1 - Subject property on Zillow:
+Find sqft, beds, baths, year built.
 
-    recordTokens(resp.usage?.input_tokens || 0);
-    console.log(`    [tokens: ${resp.usage?.input_tokens || '?'} in / ${resp.usage?.output_tokens || '?'} out]`);
+Task 2 - Find 3-5 SOLD comparable homes on Zillow Recently Sold:
+- Within ~0.5 miles of subject
+- Similar sqft (within 20%)
+- Built BEFORE 2020 (exclude new construction)
+- Single family only
+- Sold in last 12 months
+- Prefer renovated/updated homes
 
-    const text = extractText(resp.content);
-    const data = parseJSON(text);
+Task 3 - Compute ARV:
+Average price per sqft across comps, multiplied by subject sqft.
 
-    if (data.error) {
-      console.log(`    Property not found: ${data.error}`);
-      return null;
-    }
+Respond with ONLY JSON. No prose. Start with { and end with }.
 
-    console.log(`    Found: ${data.sqft} sqft, ${data.beds}bd/${data.baths}ba, built ${data.yearBuilt}`);
+Format:
+{"sqft":0,"beds":0,"baths":0,"yearBuilt":0,"arv":0,"comps":[{"address":"...","salePrice":0,"sqft":0,"saleDate":"...","url":"..."}]}
 
-    return {
-      address,
-      sqft:         data.sqft ? parseInt(data.sqft) : null,
-      yearBuilt:    data.yearBuilt ? parseInt(data.yearBuilt) : null,
-      beds:         data.beds ? parseInt(data.beds) : null,
-      baths:        data.baths ? parseFloat(data.baths) : null,
-      propertyType: 'Single Family Residential',
-      lat:          data.lat ? parseFloat(data.lat) : null,
-      lng:          data.lng ? parseFloat(data.lng) : null,
-      sourceUrl:    data.sourceUrl || null,
-      source:       'Web Search',
-    };
-  } catch (err) {
-    console.error('  Property lookup error:', err.message);
-    return null;
-  }
-}
+If subject property cannot be found: {"error":"property not found"}
+If fewer than 3 valid comps found: {"error":"insufficient comps","sqft":0,"beds":0,"baths":0,"yearBuilt":0}`
+    }],
+  });
 
-// ── COMP SEARCH (Claude + web search) ──────────────────────────────────────────
-async function findComps(property, daysBack = 180) {
-  try {
-    const { address, sqft, yearBuilt } = property;
-    if (!sqft) return [];
+  recordTokens(resp.usage?.input_tokens || 0);
+  console.log(`    [tokens: ${resp.usage?.input_tokens || '?'} in / ${resp.usage?.output_tokens || '?'} out]`);
 
-    const sqftMin = Math.round(sqft * 0.8);
-    const sqftMax = Math.round(sqft * 1.2);
-    const months  = Math.round(daysBack / 30);
-
-    console.log(`    Searching the web for comps (${months} months)...`);
-    await waitForTokenBudget(12000); // comp searches tend to be larger
-
-    const resp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 1000,
-      tools: [{
-        type: 'web_search_20250305',
-        name: 'web_search',
-        max_uses: 3,
-      }],
-      messages: [{
-        role: 'user',
-        content: `Zillow recently sold near ${address}.
-
-3-5 SOLD homes: ~0.5 mi, last ${months} mo, ${sqftMin}-${sqftMax} sqft, SFH.
-
-Return ONLY JSON array, no prose.
-Format: [{"address":"...","salePrice":0,"sqft":0,"saleDate":"...","url":"..."}]
-No comps: []`
-      }],
-    });
-
-    recordTokens(resp.usage?.input_tokens || 0);
-    console.log(`    [tokens: ${resp.usage?.input_tokens || '?'} in / ${resp.usage?.output_tokens || '?'} out]`);
-
-    const text = extractText(resp.content);
-    const comps = parseJSON(text);
-    if (!Array.isArray(comps)) return [];
-
-    const valid = comps
-      .filter(c => c.salePrice && c.sqft)
-      .map(c => ({
-        address:   c.address || 'Unknown',
-        salePrice: parseInt(c.salePrice),
-        sqft:      parseInt(c.sqft),
-        psf:       Math.round(parseInt(c.salePrice) / parseInt(c.sqft)),
-        saleDate:  c.saleDate || 'Unknown',
-        url:       c.url || '',
-      }))
-      .slice(0, 5);
-
-    console.log(`    Found ${valid.length} valid comps`);
-    return valid;
-  } catch (err) {
-    console.error('  Comp search error:', err.message);
-    return [];
-  }
+  const text = extractText(resp.content);
+  return parseJSON(text);
 }
 
 // ── FORMULA ───────────────────────────────────────────────────────────────────
@@ -305,34 +229,31 @@ function runFormula(arv, sqft, rehabPerSqft) {
     dispoA:       Math.round(dispoA),
     lowOffer:     Math.round(lowOffer),
     highOffer:    Math.round(highOffer),
-    offerArvRatio: highOffer / arv,
+    offerArvRatio: arv > 0 ? highOffer / arv : 0,
   };
 }
 
-// ── CLAUDE ASSESSMENT ────────────────────────────────────────────────────────
-async function generateNotes(address, property, comps, formula, condition, askingPrice) {
+// ── ASSESSMENT ────────────────────────────────────────────────────────────────
+async function generateNotes(address, subject, comps, formula, condition, askingPrice, rehabRate) {
   const $ = n => n != null ? '$' + Math.round(n).toLocaleString() : 'N/A';
   const pct = n => (n * 100).toFixed(1) + '%';
-  const avgPsf = Math.round(comps.reduce((s, c) => s + c.psf, 0) / comps.length);
+  const avgPsf = comps.length ? Math.round(comps.reduce((s, c) => s + (c.salePrice / c.sqft), 0) / comps.length) : 0;
 
-  const prompt = `You are the underwriting AI for Felicity Capital, a real estate wholesaling company that assigns contracts to fix-and-flip investors.
+  const prompt = `You are the underwriting AI for Felicity Capital, a real estate wholesaler.
 
-SUBJECT PROPERTY
-Address: ${address}
-Sqft: ${property.sqft} | Beds: ${property.beds} | Baths: ${property.baths} | Year Built: ${property.yearBuilt}
-Condition: ${condition || 'Full Rehab (assumed)'}
-Asking Price: ${askingPrice ? $(askingPrice) : 'Not provided'}
+SUBJECT: ${address}
+Sqft: ${subject.sqft} | Beds: ${subject.beds} | Baths: ${subject.baths} | Built: ${subject.yearBuilt}
+Condition: ${condition || 'Full Rehab (default)'} -> $${rehabRate}/sqft
+Asking: ${askingPrice ? $(askingPrice) : 'N/A'}
 
-COMPS (${comps.length} found)
-${comps.map((c, i) => `${i + 1}. ${c.address} | Sold ${$(c.salePrice)} | ${c.sqft} sqft | $${c.psf}/sqft | ${c.saleDate}`).join('\n')}
-Average PSF: $${avgPsf}/sqft -> ARV: ${$(formula.arv)}
+COMPS (${comps.length}):
+${comps.map((c, i) => `${i + 1}. ${c.address} | ${$(c.salePrice)} | ${c.sqft} sqft | ${c.saleDate}`).join('\n')}
+Avg PSF: $${avgPsf} -> ARV: ${$(formula.arv)}
 
-RESULTS
-Offer range: ${$(formula.lowOffer)} - ${$(formula.highOffer)}
-Offer/ARV: ${pct(formula.offerArvRatio)}
-${askingPrice ? `Asking vs MAO: ${askingPrice > formula.highOffer ? 'ABOVE MAO by ' + $(askingPrice - formula.highOffer) : 'BELOW MAO by ' + $(formula.highOffer - askingPrice)}` : ''}
+OFFER: ${$(formula.lowOffer)} - ${$(formula.highOffer)} | Offer/ARV: ${pct(formula.offerArvRatio)}
+${askingPrice ? `Asking vs MAO: ${askingPrice > formula.highOffer ? 'ABOVE by ' + $(askingPrice - formula.highOffer) : 'BELOW by ' + $(formula.highOffer - askingPrice)}` : ''}
 
-Write 3-4 sharp sentences covering: comp quality and consistency, neighbourhood signal, any deal flags, and a clear verdict. Be direct -- this is read by a wholesaler about to make a phone call.`;
+Write 3-4 sharp sentences: comp quality, neighbourhood signal, flags, verdict. This is read by a wholesaler about to call the seller.`;
 
   await waitForTokenBudget(2000);
 
@@ -346,7 +267,7 @@ Write 3-4 sharp sentences covering: comp quality and consistency, neighbourhood 
 }
 
 // ── SUMMARY BUILDER ───────────────────────────────────────────────────────────
-function buildSummary({ address, property, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate }) {
+function buildSummary({ address, subject, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate }) {
   const $   = n => n != null ? '$' + Math.round(n).toLocaleString() : 'N/A';
   const pct = n => (n * 100).toFixed(1) + '%';
   const flags = [];
@@ -356,7 +277,7 @@ function buildSummary({ address, property, comps, formula, condition, avgPsf, as
   if (askingPrice && askingPrice > formula.highOffer)
     flags.push(`Warning: Seller asking ${$(askingPrice - formula.highOffer)} above MAO -- tough negotiation ahead`);
   if (formula.offerArvRatio > 0.85)
-    flags.push('Warning: Offer/ARV > 85% -- thin margin for your buyer, push for lower price');
+    flags.push('Warning: Offer/ARV > 85% -- thin margin, push for lower price');
   if (comps.length < 5)
     flags.push(`Note: Only ${comps.length} comps found -- ARV estimate less certain`);
   if (formula.offerArvRatio <= 0.72 && formula.highOffer > 0)
@@ -367,14 +288,13 @@ Auto-generated by Felicity Capital Underwriter
 
 ## Property Details
 Address: ${address}
-Source: ${property.source}
-Sqft: ${property.sqft?.toLocaleString()} | Beds: ${property.beds} | Baths: ${property.baths} | Year Built: ${property.yearBuilt}
+Sqft: ${subject.sqft?.toLocaleString()} | Beds: ${subject.beds} | Baths: ${subject.baths} | Built: ${subject.yearBuilt}
 Condition: ${condition || 'Full Rehab (default)'} > $${rehabRate}/sqft rehab rate
 
 ## Comparable Sales
 ${comps.map((c, i) =>
   `${i + 1}. ${c.address}
-   Sold: ${$(c.salePrice)} | ${c.sqft?.toLocaleString()} sqft | $${c.psf}/sqft | ${c.saleDate}
+   Sold: ${$(c.salePrice)} | ${c.sqft?.toLocaleString()} sqft | $${Math.round(c.salePrice/c.sqft)}/sqft | ${c.saleDate}
    ${c.url}`
 ).join('\n\n')}
 
@@ -382,7 +302,7 @@ Average PSF: $${Math.round(avgPsf)}/sqft across ${comps.length} comps
 
 ## Formula Breakdown
 ARV:                      ${$(formula.arv)}
-Rehab Cost:               ${$(formula.rehab)}  (${property.sqft?.toLocaleString()} sqft x $${rehabRate})
+Rehab Cost:               ${$(formula.rehab)}  (${subject.sqft?.toLocaleString()} sqft x $${rehabRate})
 Closing Costs:            ${$(formula.closing)}  (6% of ARV)
 Carrying Costs:           ${$(formula.carrying)}  (2% of ARV)
 
@@ -424,76 +344,88 @@ async function processCard(card) {
     const askingRaw   = getProp(card, 'Asking Price', 'rich_text');
     const askingPrice = askingRaw ? parseFloat(String(askingRaw).replace(/[^0-9.]/g, '')) || null : null;
 
-    // ── Step 2: Property lookup
-    console.log('    Looking up property...');
-    const property = await lookupProperty(address);
+    // Determine rehab rate NOW (from condition, or default to Full Rehab)
+    const rehabRate = REHAB_RATES[condition] ?? DEFAULT_REHAB;
+    console.log(`    Rehab rate: $${rehabRate}/sqft (${condition || 'Full Rehab default'})`);
 
-    if (!property?.sqft) {
+    // Write rehab rate to card immediately, before any web search
+    await patchCard(card.id, {
+      'Rehab per Sqft': { select: { name: String(rehabRate) } }
+    });
+
+    // ── Consolidated underwrite: property + comps + ARV in one call
+    const result = await underwrite(address);
+
+    // Handle errors
+    if (result.error === 'property not found') {
       await setStatus(card.id, 'Gathering Info');
-      const missing = !property
-        ? 'address not found -- please verify it is correct'
-        : 'square footage could not be retrieved';
       await appendBlocks(card.id,
-        `Underwriting paused\n\nCould not retrieve property details: ${missing}.\n\nPlease add manually: Sqft, Year Built, Beds, Baths.`);
+        `Underwriting paused\n\nCould not find this property on Zillow. Please verify the address is correct, then manually add: Sqft, Year Built, Beds, Baths, ARV.`);
       console.log('    > Gathering Info (property not found)');
       return;
     }
 
-    console.log(`    > ${property.sqft} sqft | ${property.beds}bd/${property.baths}ba | built ${property.yearBuilt}`);
-    await patchCard(card.id, { Sqft: { number: property.sqft } });
-
-    // Small delay to avoid hitting rate limits
-    await new Promise(r => setTimeout(r, 2000));
-
-    // ── Step 3: Comps
-    console.log('    Searching comps (6 months)...');
-    let comps = await findComps(property, 180);
-
-    if (comps.length < 3) {
-      console.log(`    > Only ${comps.length}, expanding to 12 months...`);
-      await new Promise(r => setTimeout(r, 3000));
-      comps = await findComps(property, 365);
-    }
-
-    if (comps.length < 3) {
+    if (result.error === 'insufficient comps') {
+      // Save whatever property details we got
+      if (result.sqft) await patchCard(card.id, { Sqft: { number: parseInt(result.sqft) } });
       await setStatus(card.id, 'Gathering Info');
-      const sqftMin = Math.round(property.sqft * 0.8);
-      const sqftMax = Math.round(property.sqft * 1.2);
-      const yrMin   = (property.yearBuilt || 1985) - 10;
-      const yrMax   = (property.yearBuilt || 1985) + 10;
       await appendBlocks(card.id,
         `Underwriting paused -- insufficient comps\n\n` +
-        `Only ${comps.length} comp(s) found within 12 months.\n\n` +
+        `Found the property but could not find 3+ valid comps on Zillow (excluding post-2020 builds).\n\n` +
         `Manual comp pull needed. Search criteria:\n` +
         `- Half mile radius\n` +
-        `- Sqft: ${sqftMin.toLocaleString()} - ${sqftMax.toLocaleString()}\n` +
-        `- Year built: ${yrMin} - ${yrMax}\n` +
-        `- Single family homes, sold within 12 months\n\n` +
-        `Paste 3+ comp prices into the Comp #1 / #2 / #3 fields then manually re-trigger.`);
+        `- Sqft within 20% of subject\n` +
+        `- Built BEFORE 2020 (exclude new construction)\n` +
+        `- Single family, sold within 12 months\n\n` +
+        `Paste 3+ comp prices into the Comp #1/2/3 fields, add ARV manually, then re-run.`);
       console.log('    > Gathering Info (insufficient comps)');
       return;
     }
 
-    console.log(`    > ${comps.length} comps found`);
+    // Validate required fields
+    if (!result.sqft || !result.arv || !Array.isArray(result.comps) || result.comps.length < 3) {
+      await setStatus(card.id, 'Gathering Info');
+      await appendBlocks(card.id,
+        `Underwriting paused -- incomplete data from web search.\n\nReceived: sqft=${result.sqft}, arv=${result.arv}, comps=${result.comps?.length || 0}\n\nPlease check the address and retry, or fill in details manually.`);
+      console.log('    > Gathering Info (incomplete data)');
+      return;
+    }
 
-    // ── Step 4-6: ARV + formula
-    const avgPsf    = comps.reduce((s, c) => s + c.psf, 0) / comps.length;
-    const arv       = Math.round(avgPsf * property.sqft);
-    const rehabRate = REHAB_RATES[condition] ?? DEFAULT_REHAB;
-    const formula   = runFormula(arv, property.sqft, rehabRate);
-
-    // ── Claude assessment
-    console.log('    Generating assessment...');
-    const notes = await generateNotes(address, property, comps, formula, condition, askingPrice);
-
-    // ── Step 7: Write back to Notion (only writable properties)
-    const updates = {
-      ARV:                    { number: formula.arv },
-      'Max Offer':            { number: formula.highOffer },
-      'Rehab per Sqft':       { select: { name: String(rehabRate) } },
-      'Desired Assignment Fee': { number: formula.feeA },
+    const subject = {
+      sqft:      parseInt(result.sqft),
+      beds:      result.beds || null,
+      baths:     result.baths || null,
+      yearBuilt: result.yearBuilt || null,
     };
 
+    const comps = result.comps
+      .filter(c => c.salePrice && c.sqft)
+      .slice(0, 5)
+      .map(c => ({
+        address:   c.address || 'Unknown',
+        salePrice: parseInt(c.salePrice),
+        sqft:      parseInt(c.sqft),
+        saleDate:  c.saleDate || 'Unknown',
+        url:       c.url || '',
+      }));
+
+    console.log(`    > ${subject.sqft} sqft | ARV: $${result.arv.toLocaleString()} | ${comps.length} comps`);
+
+    // Run formula using Claude's ARV estimate
+    const formula = runFormula(parseInt(result.arv), subject.sqft, rehabRate);
+    const avgPsf  = comps.reduce((s, c) => s + (c.salePrice / c.sqft), 0) / comps.length;
+
+    // Generate assessment
+    console.log('    Generating assessment...');
+    const notes = await generateNotes(address, subject, comps, formula, condition, askingPrice, rehabRate);
+
+    // Write all results back
+    const updates = {
+      ARV:                      { number: formula.arv },
+      Sqft:                     { number: subject.sqft },
+      'Max Offer':              { number: formula.highOffer },
+      'Desired Assignment Fee': { number: formula.feeA },
+    };
     try {
       if (comps[0]?.url) updates['Comp #1'] = { url: comps[0].url };
       if (comps[1]?.url) updates['Comp #2'] = { url: comps[1].url };
@@ -502,14 +434,12 @@ async function processCard(card) {
 
     await patchCard(card.id, updates);
 
-    const summary = buildSummary({ address, property, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate });
+    const summary = buildSummary({ address, subject, comps, formula, condition, avgPsf, askingPrice, notes, rehabRate });
     await appendBlocks(card.id, summary);
 
-    // ── Step 8: Status
+    // Status decision
     const $ = n => '$' + Math.round(n).toLocaleString();
-    let newStatus = 'Ready to Offer';
-    if (formula.highOffer <= 0) newStatus = 'Pass';
-
+    const newStatus = formula.highOffer > 0 ? 'Ready to Offer' : 'Pass';
     await setStatus(card.id, newStatus);
 
     console.log(`    > Done: ${newStatus} | ${$(formula.lowOffer)} - ${$(formula.highOffer)} | Offer/ARV ${(formula.offerArvRatio * 100).toFixed(1)}%`);
@@ -538,7 +468,6 @@ async function poll() {
       } finally {
         processing.delete(card.id);
       }
-      // Pause between cards
       if (cards.length > 1) await new Promise(r => setTimeout(r, 5000));
     }
   } catch (err) {
@@ -551,18 +480,9 @@ console.log('Felicity Capital Underwriter');
 console.log(`Database: ${NOTION_DB}`);
 console.log(`Polling every ${POLL_MS / 1000}s\n`);
 
-if (!NOTION_DB) {
-  console.error('ERROR: NOTION_DATABASE_ID is not set or empty.');
-  process.exit(1);
-}
-if (!NOTION_TOKEN) {
-  console.error('ERROR: NOTION_TOKEN is not set.');
-  process.exit(1);
-}
-if (!ANTHROPIC_KEY) {
-  console.error('ERROR: ANTHROPIC_API_KEY is not set.');
-  process.exit(1);
-}
+if (!NOTION_DB)     { console.error('ERROR: NOTION_DATABASE_ID not set.'); process.exit(1); }
+if (!NOTION_TOKEN)  { console.error('ERROR: NOTION_TOKEN not set.');       process.exit(1); }
+if (!ANTHROPIC_KEY) { console.error('ERROR: ANTHROPIC_API_KEY not set.');  process.exit(1); }
 
 poll();
 setInterval(poll, POLL_MS);
