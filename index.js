@@ -112,9 +112,27 @@ function extractText(content) {
 }
 
 function parseJSON(text) {
+  // Try fenced code block first
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const raw = fenced ? fenced[1].trim() : text.trim();
-  return JSON.parse(raw);
+  if (fenced) return JSON.parse(fenced[1].trim());
+
+  // Try to find a JSON object or array anywhere in the text
+  // This handles cases where Claude wraps JSON in prose like "Based on my search..."
+  const objMatch = text.match(/\{[\s\S]*\}/);
+  const arrMatch = text.match(/\[[\s\S]*\]/);
+
+  // Prefer whichever appears first and is larger
+  let candidate = null;
+  if (objMatch && arrMatch) {
+    candidate = objMatch.index < arrMatch.index ? objMatch[0] : arrMatch[0];
+  } else {
+    candidate = (objMatch && objMatch[0]) || (arrMatch && arrMatch[0]);
+  }
+
+  if (candidate) return JSON.parse(candidate);
+
+  // Last resort: try parsing the raw text
+  return JSON.parse(text.trim());
 }
 
 // ── PROPERTY LOOKUP (Claude + web search) ─────────────────────────────────────
@@ -124,18 +142,20 @@ async function lookupProperty(address) {
 
     const resp = await anthropic.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 1000,
+      max_tokens: 800,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
         role: 'user',
-        content: `Look up property details for: ${address}
+        content: `Look up this address on Zillow: ${address}
 
-Search Redfin, Zillow, Realtor.com, or county tax records to find this property.
+Search Zillow specifically (zillow.com) for this property. Find the Zillow listing page and extract sqft, year built, beds, baths, and coordinates.
 
-Return ONLY a JSON object with no other text:
-{"sqft":<number or null>,"yearBuilt":<number or null>,"beds":<number or null>,"baths":<number or null>,"lat":<number or null>,"lng":<number or null>,"sourceUrl":"<url>"}
+Respond with ONLY a JSON object. No preamble, no explanation. Start with { and end with }.
 
-If you cannot find this property, return: {"error":"not found"}`
+Format:
+{"sqft":0,"yearBuilt":0,"beds":0,"baths":0,"lat":0,"lng":0,"sourceUrl":"<zillow url>"}
+
+If not on Zillow, respond with: {"error":"not found"}`
       }],
     });
 
@@ -181,28 +201,24 @@ async function findComps(property, daysBack = 180) {
 
     const resp = await anthropic.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 2000,
+      max_tokens: 1500,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
         role: 'user',
-        content: `Find recently SOLD comparable properties near: ${address}
+        content: `Search Zillow recently sold homes near: ${address}
 
-Search Redfin sold homes, Zillow recently sold, or Realtor.com for SOLD single-family homes near this address.
+Use Zillow's "Recently Sold" filter (zillow.com). Find 3-5 SOLD single-family homes matching:
+- Within ~0.5 miles of the subject
+- Sold in last ${months} months
+- Between ${sqftMin}-${sqftMax} sqft
+- Subject built ${yearBuilt || 'unknown'}
 
-Criteria:
-- Within 0.5 miles of the subject
-- Sold within last ${months} months
-- Between ${sqftMin} and ${sqftMax} sqft
-- Subject was built ${yearBuilt || 'unknown year'}, prefer similar age
-- Single family homes only
-- Prefer renovated/updated homes (these represent after-repair value)
+Respond with ONLY a JSON array. No preamble, no explanation, no prose. Start with [ and end with ].
 
-Find 3 to 5 comps with verified sale prices.
+Format:
+[{"address":"...","salePrice":0,"sqft":0,"saleDate":"...","url":"<zillow url>"}]
 
-Return ONLY a JSON array with no other text:
-[{"address":"<full address>","salePrice":<number>,"sqft":<number>,"saleDate":"<date>","url":"<listing url>"}]
-
-If you cannot find any comps, return: []`
+If no sold comps match on Zillow, respond with: []`
       }],
     });
 
@@ -393,12 +409,16 @@ async function processCard(card) {
     console.log(`    > ${property.sqft} sqft | ${property.beds}bd/${property.baths}ba | built ${property.yearBuilt}`);
     await patchCard(card.id, { Sqft: { number: property.sqft } });
 
+    // Small delay to avoid hitting rate limits
+    await new Promise(r => setTimeout(r, 2000));
+
     // ── Step 3: Comps
     console.log('    Searching comps (6 months)...');
     let comps = await findComps(property, 180);
 
     if (comps.length < 3) {
       console.log(`    > Only ${comps.length}, expanding to 12 months...`);
+      await new Promise(r => setTimeout(r, 3000));
       comps = await findComps(property, 365);
     }
 
@@ -476,10 +496,17 @@ async function poll() {
     const cards = await getUnderwritingCards();
     console.log(`${cards.length} card(s) to process`);
 
+    // Process cards sequentially to stay under rate limits
     for (const card of cards) {
       if (processing.has(card.id)) continue;
       processing.add(card.id);
-      processCard(card).finally(() => processing.delete(card.id));
+      try {
+        await processCard(card);
+      } finally {
+        processing.delete(card.id);
+      }
+      // Pause between cards
+      if (cards.length > 1) await new Promise(r => setTimeout(r, 5000));
     }
   } catch (err) {
     console.error('Poll error:', err.message);
