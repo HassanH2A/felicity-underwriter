@@ -10,6 +10,32 @@ const POLL_MS       = 60_000;
 const anthropic  = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const processing = new Set(); // cards currently in flight
 
+// ── RATE LIMIT TRACKING ───────────────────────────────────────────────────────
+// Anthropic Tier 1: 30,000 input tokens per minute
+// We conservatively budget 25,000 to leave headroom
+const TPM_BUDGET = 25_000;
+const tokenLog = []; // array of { time, tokens }
+
+function recordTokens(n) {
+  tokenLog.push({ time: Date.now(), tokens: n });
+}
+
+function tokensInLastMinute() {
+  const cutoff = Date.now() - 60_000;
+  while (tokenLog.length && tokenLog[0].time < cutoff) tokenLog.shift();
+  return tokenLog.reduce((s, e) => s + e.tokens, 0);
+}
+
+async function waitForTokenBudget(estimatedTokens) {
+  const used = tokensInLastMinute();
+  if (used + estimatedTokens > TPM_BUDGET) {
+    const oldest = tokenLog[0]?.time || Date.now();
+    const waitMs = Math.max(5000, 60_000 - (Date.now() - oldest) + 1000);
+    console.log(`    [Rate limit: used ${used}, waiting ${Math.round(waitMs/1000)}s]`);
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+}
+
 // ── REHAB RATES ───────────────────────────────────────────────────────────────
 const REHAB_RATES = {
   'Turnkey':       0,
@@ -139,25 +165,28 @@ function parseJSON(text) {
 async function lookupProperty(address) {
   try {
     console.log('    Searching the web for property data...');
+    await waitForTokenBudget(8000); // web_search calls can run 5-10k input tokens
 
     const resp = await anthropic.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 800,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      max_tokens: 500,
+      tools: [{
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 2,
+      }],
       messages: [{
         role: 'user',
-        content: `Look up this address on Zillow: ${address}
+        content: `Zillow lookup: ${address}
 
-Search Zillow specifically (zillow.com) for this property. Find the Zillow listing page and extract sqft, year built, beds, baths, and coordinates.
+Return ONLY JSON, no prose. Format: {"sqft":0,"yearBuilt":0,"beds":0,"baths":0,"lat":0,"lng":0,"sourceUrl":"..."}
 
-Respond with ONLY a JSON object. No preamble, no explanation. Start with { and end with }.
-
-Format:
-{"sqft":0,"yearBuilt":0,"beds":0,"baths":0,"lat":0,"lng":0,"sourceUrl":"<zillow url>"}
-
-If not on Zillow, respond with: {"error":"not found"}`
+Not found: {"error":"not found"}`
       }],
     });
+
+    recordTokens(resp.usage?.input_tokens || 0);
+    console.log(`    [tokens: ${resp.usage?.input_tokens || '?'} in / ${resp.usage?.output_tokens || '?'} out]`);
 
     const text = extractText(resp.content);
     const data = parseJSON(text);
@@ -198,29 +227,30 @@ async function findComps(property, daysBack = 180) {
     const months  = Math.round(daysBack / 30);
 
     console.log(`    Searching the web for comps (${months} months)...`);
+    await waitForTokenBudget(12000); // comp searches tend to be larger
 
     const resp = await anthropic.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 1500,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      max_tokens: 1000,
+      tools: [{
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 3,
+      }],
       messages: [{
         role: 'user',
-        content: `Search Zillow recently sold homes near: ${address}
+        content: `Zillow recently sold near ${address}.
 
-Use Zillow's "Recently Sold" filter (zillow.com). Find 3-5 SOLD single-family homes matching:
-- Within ~0.5 miles of the subject
-- Sold in last ${months} months
-- Between ${sqftMin}-${sqftMax} sqft
-- Subject built ${yearBuilt || 'unknown'}
+3-5 SOLD homes: ~0.5 mi, last ${months} mo, ${sqftMin}-${sqftMax} sqft, SFH.
 
-Respond with ONLY a JSON array. No preamble, no explanation, no prose. Start with [ and end with ].
-
-Format:
-[{"address":"...","salePrice":0,"sqft":0,"saleDate":"...","url":"<zillow url>"}]
-
-If no sold comps match on Zillow, respond with: []`
+Return ONLY JSON array, no prose.
+Format: [{"address":"...","salePrice":0,"sqft":0,"saleDate":"...","url":"..."}]
+No comps: []`
       }],
     });
+
+    recordTokens(resp.usage?.input_tokens || 0);
+    console.log(`    [tokens: ${resp.usage?.input_tokens || '?'} in / ${resp.usage?.output_tokens || '?'} out]`);
 
     const text = extractText(resp.content);
     const comps = parseJSON(text);
@@ -304,11 +334,14 @@ ${askingPrice ? `Asking vs MAO: ${askingPrice > formula.highOffer ? 'ABOVE MAO b
 
 Write 3-4 sharp sentences covering: comp quality and consistency, neighbourhood signal, any deal flags, and a clear verdict. Be direct -- this is read by a wholesaler about to make a phone call.`;
 
+  await waitForTokenBudget(2000);
+
   const resp = await anthropic.messages.create({
     model:      'claude-sonnet-4-5-20250929',
     max_tokens: 400,
     messages:   [{ role: 'user', content: prompt }],
   });
+  recordTokens(resp.usage?.input_tokens || 0);
   return resp.content[0].text.trim();
 }
 
